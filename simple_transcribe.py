@@ -1,6 +1,6 @@
 import assemblyai as aai
 
-aai.settings.api_key = "ff2c5e1943f747f283c59b2f5bb037fe"
+aai.settings.api_key = "ff2"
 
 config = aai.TranscriptionConfig(
     speaker_labels=True,  # Enable speaker diarization
