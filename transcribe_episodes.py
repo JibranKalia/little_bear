@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
-transcribe_episodes.py - Transcribe Little Bear episodes with speaker diarization
+transcribe_episodes.py - Transcribe Little Bear episodes using local whisper
 """
 
 import os
 import sys
 import json
 import time
+import rich
+import subprocess
 from pathlib import Path
 from typing import Dict, List, Optional
 from dataclasses import dataclass, asdict
 from datetime import datetime
-import assemblyai as aai
 from rich.console import Console
 from rich.table import Table
 
@@ -23,36 +24,25 @@ class EpisodeTranscript:
     season: str
     episode_number: str
     full_text: str
-    utterances: List[Dict]
+    segments: List[Dict]  # Whisper segments instead of utterances
     duration_seconds: float
     processing_time_seconds: float
     word_count: int
-    speaker_count: int
+    segment_count: int  # Number of segments instead of speaker count
 
-class LittleBearTranscriber:
-    def __init__(self, api_key: Optional[str] = None):
-        # Set API key from environment variable or parameter
-        self.api_key = api_key or os.environ.get("ASSEMBLYAI_API_KEY")
-        if not self.api_key:
-            console.print("[red]Error: AssemblyAI API key not found![/red]")
-            console.print("Set it with: export ASSEMBLYAI_API_KEY='your_key_here'")
-            console.print("Or pass it with: --api-key YOUR_KEY")
+class LittleBearWhisperTranscriber:
+    def __init__(self, whisper_path: Optional[str] = None):
+        # Set whisper-cli path and working directory
+        self.whisper_path = whisper_path or "/Users/jibrankalia/side/whisper.cpp/build/bin/whisper-cli"
+        self.whisper_dir = "/Users/jibrankalia/side/whisper.cpp"
+        
+        # Check if whisper-cli exists
+        if not os.path.exists(self.whisper_path):
+            console.print(f"[red]Error: whisper-cli not found at {self.whisper_path}![/red]")
+            console.print("Please build whisper.cpp or provide the correct path with --whisper-path")
             sys.exit(1)
         
-        console.print(f"[green]✓ API key found (ending in ...{self.api_key[-4:]})[/green]")
-        aai.settings.api_key = self.api_key
-        
-        # Configure transcription settings for Little Bear
-        self.config = aai.TranscriptionConfig(
-            speaker_labels=True,  # Enable speaker diarization
-            speakers_expected=6,   # Typical number of characters per episode
-            speech_model=aai.SpeechModel.best,  # Best model for accuracy
-            language_code="en_us",
-            punctuate=True,
-            format_text=True,
-        )
-        
-        self.transcriber = aai.Transcriber(config=self.config)
+        console.print(f"[green]✓ whisper-cli found at {self.whisper_path}[/green]")
         
         # Paths
         self.base_dir = Path("/Users/jibrankalia/side/little_bear")
@@ -108,8 +98,10 @@ class LittleBearTranscriber:
         """Process a single episode with retry logic"""
         episode_id, season, episode = self.parse_episode_id(audio_file)
         
-        # Check if already processed
+        # Check if already processed (both our JSON and whisper JSON)
         output_file = self.output_dir / f"{episode_id}.json"
+        whisper_json_path = f"{str(audio_file)}.json"
+        
         if output_file.exists():
             console.print(f"[yellow]⟳ Skipping {episode_id} (already processed)[/yellow]")
             return None
@@ -122,41 +114,64 @@ class LittleBearTranscriber:
         start_time = time.time()
         transcript = None
         
-        # Retry logic for handling timeouts
-        max_retries = 3
-        retry_delay = 30  # Start with 30 seconds
-        
-        for attempt in range(max_retries):
-            try:
-                # Transcribe with progress indicator
-                status_msg = f"[cyan]Uploading and transcribing {episode_id}... (attempt {attempt + 1}/{max_retries}"
-                if file_size_mb > 100:
-                    status_msg += f", large file may take 5-10 minutes"
-                status_msg += ")[/cyan]"
-                
-                with console.status(status_msg, spinner="dots"):
-                    transcript = self.transcriber.transcribe(str(audio_file))
-                
-                # If we get here, transcription was successful
-                break
-                
-            except Exception as e:
-                console.print(f"[red]✗ Attempt {attempt + 1} failed: {str(e)}[/red]")
-                console.print(f"[red]Error type: {type(e).__name__}[/red]")
-                
-                if "timeout" in str(e).lower() or "timed out" in str(e).lower():
-                    console.print(f"[yellow]Timeout error detected. File size: {file_size_mb:.1f} MB[/yellow]")
-                    console.print(f"[yellow]Note: AssemblyAI supports files up to 5GB/10 hours.[/yellow]")
-                    console.print(f"[yellow]This is likely a network timeout, not an API limitation.[/yellow]")
-                
-                if attempt < max_retries - 1:
-                    console.print(f"[yellow]Retrying in {retry_delay} seconds...[/yellow]")
-                    time.sleep(retry_delay)
-                    retry_delay *= 2  # Exponential backoff
-                else:
-                    console.print(f"[red]Failed after {max_retries} attempts[/red]")
-                    self.stats["errors"] += 1
-                    return None
+        # Check if whisper JSON already exists from previous run
+        if os.path.exists(whisper_json_path):
+            console.print(f"[yellow]⟳ Using existing whisper output for {episode_id}[/yellow]")
+            with open(whisper_json_path, 'r', encoding='utf-8') as f:
+                transcript = json.load(f)
+        else:
+            # Retry logic for handling timeouts
+            max_retries = 3
+            retry_delay = 30  # Start with 30 seconds
+            
+            for attempt in range(max_retries):
+                try:
+                    # Transcribe with progress indicator
+                    status_msg = f"[cyan]Transcribing {episode_id} with whisper-cli... (attempt {attempt + 1}/{max_retries})[/cyan]"
+                    
+                    with console.status(status_msg, spinner="dots"):
+                        # Run whisper-cli subprocess from whisper.cpp directory
+                        audio_full_path = audio_file.resolve()  # Get absolute path
+                        cmd = [self.whisper_path, "-f", str(audio_full_path), "--output-json"]
+                        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600, cwd=self.whisper_dir)
+                        
+                        if result.returncode != 0:
+                            raise RuntimeError(f"whisper-cli failed: {result.stderr}")
+                        
+                        # Load the JSON output file
+                        if not os.path.exists(whisper_json_path):
+                            raise FileNotFoundError(f"Expected JSON output not found: {whisper_json_path}")
+                        
+                        with open(whisper_json_path, 'r', encoding='utf-8') as f:
+                            transcript = json.load(f)
+                    
+                    # If we get here, transcription was successful
+                    break
+                    
+                except subprocess.TimeoutExpired:
+                    console.print(f"[red]✗ Attempt {attempt + 1} timed out after 10 minutes[/red]")
+                    console.print(f"[yellow]File size: {file_size_mb:.1f} MB - large files may take longer[/yellow]")
+                    
+                    if attempt < max_retries - 1:
+                        console.print(f"[yellow]Retrying in {retry_delay} seconds...[/yellow]")
+                        time.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
+                    else:
+                        console.print(f"[red]Failed after {max_retries} attempts[/red]")
+                        self.stats["errors"] += 1
+                        return None
+                except Exception as e:
+                    console.print(f"[red]✗ Attempt {attempt + 1} failed: {str(e)}[/red]")
+                    console.print(f"[red]Error type: {type(e).__name__}[/red]")
+                    
+                    if attempt < max_retries - 1:
+                        console.print(f"[yellow]Retrying in {retry_delay} seconds...[/yellow]")
+                        time.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
+                    else:
+                        console.print(f"[red]Failed after {max_retries} attempts[/red]")
+                        self.stats["errors"] += 1
+                        return None
         
         # Check if transcript was obtained
         if not transcript:
@@ -164,42 +179,42 @@ class LittleBearTranscriber:
             self.stats["errors"] += 1
             return None
         
-        # Check for errors after successful transcription
-        if transcript.status == "error":
-            console.print(f"[red]✗ Error: {transcript.error}[/red]")
-            self.stats["errors"] += 1
-            return None
-        
-        # Extract utterances with speaker labels
-        utterances = []
-        if transcript.utterances:
-            for utterance in transcript.utterances:
-                utterances.append({
-                    "speaker": utterance.speaker,
-                    "text": utterance.text,
-                    "start_ms": utterance.start,
-                    "end_ms": utterance.end,
-                    "confidence": utterance.confidence,
-                    "words": len(utterance.text.split())
+        # Extract segments from whisper transcription
+        segments = []
+        full_text_parts = []
+        if "transcription" in transcript:
+            for segment in transcript["transcription"]:
+                segments.append({
+                    "text": segment["text"].strip(),
+                    "start_ms": segment["offsets"]["from"],
+                    "end_ms": segment["offsets"]["to"],
+                    "timestamp_from": segment["timestamps"]["from"],
+                    "timestamp_to": segment["timestamps"]["to"],
+                    "words": len(segment["text"].split())
                 })
+                full_text_parts.append(segment["text"].strip())
         
         # Calculate statistics
-        duration = (transcript.audio_duration or 0) / 1000  # Convert to seconds
+        full_text = " ".join(full_text_parts)
         processing_time = time.time() - start_time
-        word_count = len(transcript.text.split()) if transcript.text else 0
-        unique_speakers = len(set(u["speaker"] for u in utterances)) if utterances else 0
+        word_count = len(full_text.split()) if full_text else 0
+        
+        # Estimate duration from last segment if available
+        duration = 0
+        if segments:
+            duration = segments[-1]["end_ms"] / 1000  # Convert to seconds
         
         # Create result object
         result = EpisodeTranscript(
             episode_id=episode_id,
             season=season,
             episode_number=episode,
-            full_text=transcript.text or "",
-            utterances=utterances,
+            full_text=full_text,
+            segments=segments,
             duration_seconds=duration,
             processing_time_seconds=processing_time,
             word_count=word_count,
-            speaker_count=unique_speakers
+            segment_count=len(segments)
         )
         
         # Save to JSON
@@ -225,11 +240,11 @@ class LittleBearTranscriber:
                 "duration_seconds": transcript.duration_seconds,
                 "processing_time_seconds": transcript.processing_time_seconds,
                 "word_count": transcript.word_count,
-                "speaker_count": transcript.speaker_count,
+                "segment_count": transcript.segment_count,
                 "processed_at": datetime.now().isoformat()
             },
             "full_text": transcript.full_text,
-            "utterances": transcript.utterances
+            "segments": transcript.segments
         }
         
         with open(output_file, 'w', encoding='utf-8') as f:
@@ -245,22 +260,18 @@ class LittleBearTranscriber:
         
         table.add_row("Duration", f"{transcript.duration_seconds:.1f} seconds")
         table.add_row("Words", str(transcript.word_count))
-        table.add_row("Speakers", str(transcript.speaker_count))
+        table.add_row("Segments", str(transcript.segment_count))
         table.add_row("Processing Time", f"{transcript.processing_time_seconds:.1f} seconds")
-        table.add_row("Utterances", str(len(transcript.utterances)))
         
         console.print(table)
         
-        # Show speaker distribution
-        if transcript.utterances:
-            speaker_counts = {}
-            for u in transcript.utterances:
-                speaker = u["speaker"]
-                speaker_counts[speaker] = speaker_counts.get(speaker, 0) + 1
-            
-            console.print("\n[cyan]Speaker Distribution:[/cyan]")
-            for speaker, count in sorted(speaker_counts.items()):
-                console.print(f"  {speaker}: {count} utterances")
+        # Show segment sample
+        if transcript.segments and len(transcript.segments) > 0:
+            console.print("\n[cyan]Sample segments:[/cyan]")
+            for i, segment in enumerate(transcript.segments[:3]):  # Show first 3 segments
+                console.print(f"  [{segment['timestamp_from']} -> {segment['timestamp_to']}] {segment['text'][:50]}...")
+            if len(transcript.segments) > 3:
+                console.print(f"  ... and {len(transcript.segments) - 3} more segments")
     
     def run(self, limit: Optional[int] = None):
         """Process all episodes"""
@@ -281,13 +292,12 @@ class LittleBearTranscriber:
         
         console.print(f"\n[green]Ready to process {len(audio_files)} audio file(s)[/green]")
         
-        # Calculate costs
+        # Calculate estimated time
         total_minutes = sum(self.get_duration_minutes(f) for f in audio_files)
-        estimated_cost = total_minutes * 0.0045  # $0.0045 per minute
-        console.print(f"Estimated cost: [green]${estimated_cost:.2f}[/green] for ~{total_minutes:.1f} minutes")
+        console.print(f"Estimated processing time: ~{total_minutes:.1f} minutes of audio")
         
         # Confirm
-        if not self.confirm_processing(len(audio_files), estimated_cost):
+        if not self.confirm_processing(len(audio_files)):
             console.print("[yellow]Cancelled by user[/yellow]")
             return
         
@@ -296,9 +306,9 @@ class LittleBearTranscriber:
             console.print(f"\n[bold]File {i}/{len(audio_files)}[/bold]")
             self.process_single_episode(audio_file)
             
-            # Rate limiting (AssemblyAI allows 5 concurrent)
+            # Brief pause between files
             if i < len(audio_files):
-                time.sleep(1)
+                time.sleep(0.5)
         
         # Print final summary
         self.print_final_summary()
@@ -309,9 +319,9 @@ class LittleBearTranscriber:
         size_mb = audio_file.stat().st_size / (1024 * 1024)
         return size_mb / 10.5
     
-    def confirm_processing(self, count: int, cost: float) -> bool:
+    def confirm_processing(self, count: int) -> bool:
         """Ask for confirmation before processing"""
-        response = console.input(f"\n[yellow]Process {count} files for ~${cost:.2f}? (y/n): [/yellow]")
+        response = console.input(f"\n[yellow]Process {count} files with local whisper? (y/n): [/yellow]")
         return response.lower() in ['y', 'yes']
     
     def print_final_summary(self):
@@ -341,13 +351,13 @@ if __name__ == "__main__":
     
     console.print("[cyan]Starting Little Bear Transcriber...[/cyan]")
     
-    parser = argparse.ArgumentParser(description="Transcribe Little Bear episodes")
+    parser = argparse.ArgumentParser(description="Transcribe Little Bear episodes with whisper")
     parser.add_argument("--limit", type=int, help="Limit number of episodes to process")
-    parser.add_argument("--api-key", help="AssemblyAI API key (or set ASSEMBLYAI_API_KEY env)")
+    parser.add_argument("--whisper-path", help="Path to whisper-cli binary (default: ./build/bin/whisper-cli)")
     args = parser.parse_args()
     
     try:
-        transcriber = LittleBearTranscriber(api_key=args.api_key)
+        transcriber = LittleBearWhisperTranscriber(whisper_path=getattr(args, 'whisper_path', None))
         transcriber.run(limit=args.limit)
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted by user[/yellow]")
