@@ -105,7 +105,7 @@ class LittleBearTranscriber:
         return stem, season, episode
     
     def process_single_episode(self, audio_file: Path) -> Optional[EpisodeTranscript]:
-        """Process a single episode"""
+        """Process a single episode with retry logic"""
         episode_id, season, episode = self.parse_episode_id(audio_file)
         
         # Check if already processed
@@ -116,72 +116,104 @@ class LittleBearTranscriber:
         
         console.print(f"\n[cyan]━━━ Processing {episode_id} ━━━[/cyan]")
         console.print(f"Audio file: {audio_file}")
-        console.print(f"File size: {audio_file.stat().st_size / (1024*1024):.1f} MB")
+        file_size_mb = audio_file.stat().st_size / (1024*1024)
+        console.print(f"File size: {file_size_mb:.1f} MB")
         
         start_time = time.time()
+        transcript = None
         
-        try:
-            # Transcribe with progress indicator
-            with console.status(f"[cyan]Uploading and transcribing {episode_id}... (this may take a few minutes)[/cyan]", spinner="dots"):
-                transcript = self.transcriber.transcribe(str(audio_file))
-            
-            # Check for errors
-            if transcript.status == "error":
-                console.print(f"[red]✗ Error: {transcript.error}[/red]")
-                self.stats["errors"] += 1
-                return None
-            
-            # Extract utterances with speaker labels
-            utterances = []
-            if transcript.utterances:
-                for utterance in transcript.utterances:
-                    utterances.append({
-                        "speaker": utterance.speaker,
-                        "text": utterance.text,
-                        "start_ms": utterance.start,
-                        "end_ms": utterance.end,
-                        "confidence": utterance.confidence,
-                        "words": len(utterance.text.split())
-                    })
-            
-            # Calculate statistics
-            duration = (transcript.audio_duration or 0) / 1000  # Convert to seconds
-            processing_time = time.time() - start_time
-            word_count = len(transcript.text.split()) if transcript.text else 0
-            unique_speakers = len(set(u["speaker"] for u in utterances)) if utterances else 0
-            
-            # Create result object
-            result = EpisodeTranscript(
-                episode_id=episode_id,
-                season=season,
-                episode_number=episode,
-                full_text=transcript.text or "",
-                utterances=utterances,
-                duration_seconds=duration,
-                processing_time_seconds=processing_time,
-                word_count=word_count,
-                speaker_count=unique_speakers
-            )
-            
-            # Save to JSON
-            self.save_transcript(result, output_file)
-            
-            # Update stats
-            self.stats["processed"] += 1
-            self.stats["total_duration"] += duration
-            self.stats["total_words"] += word_count
-            
-            # Print summary
-            self.print_episode_summary(result)
-            
-            return result
-            
-        except Exception as e:
-            console.print(f"[red]✗ Error processing {episode_id}: {str(e)}[/red]")
-            import traceback
-            console.print(f"[red]{traceback.format_exc()}[/red]")
+        # Retry logic for handling timeouts
+        max_retries = 3
+        retry_delay = 30  # Start with 30 seconds
+        
+        for attempt in range(max_retries):
+            try:
+                # Transcribe with progress indicator
+                status_msg = f"[cyan]Uploading and transcribing {episode_id}... (attempt {attempt + 1}/{max_retries}"
+                if file_size_mb > 100:
+                    status_msg += f", large file may take 5-10 minutes"
+                status_msg += ")[/cyan]"
+                
+                with console.status(status_msg, spinner="dots"):
+                    transcript = self.transcriber.transcribe(str(audio_file))
+                
+                # If we get here, transcription was successful
+                break
+                
+            except Exception as e:
+                console.print(f"[red]✗ Attempt {attempt + 1} failed: {str(e)}[/red]")
+                console.print(f"[red]Error type: {type(e).__name__}[/red]")
+                
+                if "timeout" in str(e).lower() or "timed out" in str(e).lower():
+                    console.print(f"[yellow]Timeout error detected. File size: {file_size_mb:.1f} MB[/yellow]")
+                    console.print(f"[yellow]Note: AssemblyAI supports files up to 5GB/10 hours.[/yellow]")
+                    console.print(f"[yellow]This is likely a network timeout, not an API limitation.[/yellow]")
+                
+                if attempt < max_retries - 1:
+                    console.print(f"[yellow]Retrying in {retry_delay} seconds...[/yellow]")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                else:
+                    console.print(f"[red]Failed after {max_retries} attempts[/red]")
+                    self.stats["errors"] += 1
+                    return None
+        
+        # Check if transcript was obtained
+        if not transcript:
+            console.print(f"[red]✗ Failed to transcribe {episode_id}[/red]")
             self.stats["errors"] += 1
             return None
+        
+        # Check for errors after successful transcription
+        if transcript.status == "error":
+            console.print(f"[red]✗ Error: {transcript.error}[/red]")
+            self.stats["errors"] += 1
+            return None
+        
+        # Extract utterances with speaker labels
+        utterances = []
+        if transcript.utterances:
+            for utterance in transcript.utterances:
+                utterances.append({
+                    "speaker": utterance.speaker,
+                    "text": utterance.text,
+                    "start_ms": utterance.start,
+                    "end_ms": utterance.end,
+                    "confidence": utterance.confidence,
+                    "words": len(utterance.text.split())
+                })
+        
+        # Calculate statistics
+        duration = (transcript.audio_duration or 0) / 1000  # Convert to seconds
+        processing_time = time.time() - start_time
+        word_count = len(transcript.text.split()) if transcript.text else 0
+        unique_speakers = len(set(u["speaker"] for u in utterances)) if utterances else 0
+        
+        # Create result object
+        result = EpisodeTranscript(
+            episode_id=episode_id,
+            season=season,
+            episode_number=episode,
+            full_text=transcript.text or "",
+            utterances=utterances,
+            duration_seconds=duration,
+            processing_time_seconds=processing_time,
+            word_count=word_count,
+            speaker_count=unique_speakers
+        )
+        
+        # Save to JSON
+        self.save_transcript(result, output_file)
+        
+        # Update stats
+        self.stats["processed"] += 1
+        self.stats["total_duration"] += duration
+        self.stats["total_words"] += word_count
+        
+        # Print summary
+        self.print_episode_summary(result)
+        
+        return result
     
     def save_transcript(self, transcript: EpisodeTranscript, output_file: Path):
         """Save transcript to JSON file"""
