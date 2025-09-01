@@ -296,10 +296,7 @@ class LittleBearWhisperTranscriber:
         total_minutes = sum(self.get_duration_minutes(f) for f in audio_files)
         console.print(f"Estimated processing time: ~{total_minutes:.1f} minutes of audio")
         
-        # Confirm
-        if not self.confirm_processing(len(audio_files)):
-            console.print("[yellow]Cancelled by user[/yellow]")
-            return
+        console.print("[green]Starting transcription...[/green]")
         
         # Process each file
         for i, audio_file in enumerate(audio_files, 1):
